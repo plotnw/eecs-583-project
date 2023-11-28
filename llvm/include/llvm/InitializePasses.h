@@ -248,6 +248,7 @@ void initializeLoopPassPass(PassRegistry&);
 void initializeLoopPredicationLegacyPassPass(PassRegistry&);
 void initializeLoopRerollLegacyPassPass(PassRegistry &);
 void initializeLoopRollingLegacyPassPass(PassRegistry &);
+void initializeLoopRollingLegacyCFGPassPass(PassRegistry &);
 void initializeLoopRotateLegacyPassPass(PassRegistry&);
 void initializeLoopSimplifyCFGLegacyPassPass(PassRegistry&);
 void initializeLoopSimplifyPass(PassRegistry&);

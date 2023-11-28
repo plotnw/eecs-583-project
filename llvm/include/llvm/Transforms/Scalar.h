@@ -200,6 +200,8 @@ Pass *createLoopUnrollAndJamPass(int OptLevel = 2);
 //
 Pass *createLoopRerollPass();
 FunctionPass *createLoopRollingPass();
+FunctionPass *createLoopRollingCFGPass();
+
 
 //===----------------------------------------------------------------------===//
 //
