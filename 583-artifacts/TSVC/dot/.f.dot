@@ -1,0 +1,5 @@
+digraph "CFG for 'f' function" {
+	label="CFG for 'f' function";
+
+	Node0x564c93cc67f0 [shape=record,color="#b70d28ff", style=filled, fillcolor="#b70d2870",label="{entry:\l  %mul = fmul float %a, %b\l  ret float %mul\l}"];
+}

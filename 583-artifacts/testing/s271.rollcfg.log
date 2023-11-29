@@ -1,0 +1,20 @@
+Attempting to Optimize: s271
+PLEASE submit a bug report to https://bugs.llvm.org/ and include the crash backtrace.
+Stack dump:
+0.	Program arguments: ../../build/release/bin/opt -loop-rolling-cfg -simplifycfg -loop-simplify -loop-flatten -licm s271.ll -o s271.rollcfg.ll 
+1.	Running pass 'Function Pass Manager' on module 's271.ll'.
+2.	Running pass 'Loop rolling over some non-straight-line code' on function '@s271'
+ #0 0x000055aa5caeea92 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (../../build/release/bin/opt+0x1d8ca92)
+ #1 0x000055aa5caec614 llvm::sys::RunSignalHandlers() (../../build/release/bin/opt+0x1d8a614)
+ #2 0x000055aa5caec778 SignalHandler(int) (../../build/release/bin/opt+0x1d8a778)
+ #3 0x00007f5974442520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)
+ #4 0x000055aa5c9f69a7 LoopRollerCFG::run() (../../build/release/bin/opt+0x1c949a7)
+ #5 0x000055aa5c9f704e llvm::LoopRollingCFG::runImpl(llvm::Function&, llvm::ScalarEvolution*, llvm::DominatorTree*) (../../build/release/bin/opt+0x1c9504e)
+ #6 0x000055aa5c20286f llvm::FPPassManager::runOnFunction(llvm::Function&) (../../build/release/bin/opt+0x14a086f)
+ #7 0x000055aa5c202f59 llvm::FPPassManager::runOnModule(llvm::Module&) (../../build/release/bin/opt+0x14a0f59)
+ #8 0x000055aa5c2019eb llvm::legacy::PassManagerImpl::run(llvm::Module&) (../../build/release/bin/opt+0x149f9eb)
+ #9 0x000055aa5b1fd79a main (../../build/release/bin/opt+0x49b79a)
+#10 0x00007f5974429d90 __libc_start_call_main ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+#11 0x00007f5974429e40 call_init ./csu/../csu/libc-start.c:128:20
+#12 0x00007f5974429e40 __libc_start_main ./csu/../csu/libc-start.c:379:5
+#13 0x000055aa5b278d85 _start (../../build/release/bin/opt+0x516d85)

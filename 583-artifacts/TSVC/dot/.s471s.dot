@@ -1,0 +1,5 @@
+digraph "CFG for 's471s' function" {
+	label="CFG for 's471s' function";
+
+	Node0x564c93c7b6a0 [shape=record,color="#b70d28ff", style=filled, fillcolor="#b70d2870",label="{entry:\l  ret i32 0\l}"];
+}

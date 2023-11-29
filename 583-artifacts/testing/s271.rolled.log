@@ -1,0 +1,31 @@
+Optimizing: s271
+BlockSize: 4
+Attempting Group:
+Attempting Group:
+BlockSize: 2
+  %nl.029 = phi i32 [ 0, %entry ], [ %inc15, %for.cond.cleanup4 ]
+BlockSize: 4
+Attempting Group:
+Attempting Group:
+BlockSize: 4
+Attempting Group:
+BlockSize: 5
+  %indvars.iv = phi i64 [ 0, %for.cond2.preheader ], [ %indvars.iv.next, %for.inc ]
+BlockSize: 8
+Attempting Group:
+BlockSize: 3
+Done Loop Roller: 0/0
+Nothing found in: s271
+Optimizing: time_function
+BlockSize: 28
+Attempting Group:
+Attempting Group:
+Done Loop Roller: 0/0
+Nothing found in: time_function
+Optimizing: main
+BlockSize: 16
+Attempting Group:
+Attempting Group:
+Attempting Group:
+Done Loop Roller: 0/0
+Nothing found in: main

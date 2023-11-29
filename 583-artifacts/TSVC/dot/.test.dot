@@ -1,0 +1,10 @@
+digraph "CFG for 'test' function" {
+	label="CFG for 'test' function";
+
+	Node0x564c93aa2650 [shape=record,color="#3d50c3ff", style=filled, fillcolor="#b9d0f970",label="{entry:\l  br label %for.body\l}"];
+	Node0x564c93aa2650 -> Node0x564c93aa26a0;
+	Node0x564c93aa2790 [shape=record,color="#3d50c3ff", style=filled, fillcolor="#b9d0f970",label="{for.cond.cleanup:                                 \l  ret float %add\l}"];
+	Node0x564c93aa26a0 [shape=record,color="#b70d28ff", style=filled, fillcolor="#b70d2870",label="{for.body:                                         \l  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\l  %s.06 = phi float [ 0.000000e+00, %entry ], [ %add, %for.body ]\l  %arrayidx = getelementptr inbounds float, float* %A, i64 %indvars.iv\l  %0 = load float, float* %arrayidx, align 4, !tbaa !2\l  %add = fadd float %s.06, %0\l  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\l  %exitcond.not = icmp eq i64 %indvars.iv.next, 4\l  br i1 %exitcond.not, label %for.cond.cleanup, label %for.body, !llvm.loop !6\l|{<s0>T|<s1>F}}"];
+	Node0x564c93aa26a0:s0 -> Node0x564c93aa2790;
+	Node0x564c93aa26a0:s1 -> Node0x564c93aa26a0;
+}
