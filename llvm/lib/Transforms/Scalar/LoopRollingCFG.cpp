@@ -82,15 +82,21 @@ Optional<BasicBlock *> findTerminatorBlock(Function &F) {
   }
 }
 
-std::vector<BasicBlock *> & findDominators(DominatorTree *DT, Function &F, BasicBlock *target_BB) {
+std::vector<BasicBlock *> findDominators(DominatorTree *DT, Function &F, BasicBlock *target_BB) {
   std::vector<BasicBlock *> dominators;
   for (BasicBlock &BB : F) {
     auto inst_node = DT->getNode(&BB);
-    for (auto child : inst_node->children()) {
-      BasicBlock *dominated_BB = child->getBlock();
-      if (dominated_BB == target_BB) {
-        dominators.push_back(inst_node->getBlock());
+
+    if (inst_node) {
+        for (auto child : inst_node->children()) {
+          BasicBlock *dominated_BB = child->getBlock();
+          if (dominated_BB == target_BB) {
+            dominators.push_back(inst_node->getBlock());
+          }
       }
+    }
+    else {
+      errs() << "Unreachable block: " << BB.getName() << "\n";
     }
   }
   return dominators;
@@ -3657,7 +3663,6 @@ bool LoopRollerCFG::run() {
 
   BasicBlock *terminator_block = terminator_block_check.getValue();
   std::vector<BasicBlock*> dominators_of_terminator = findDominators(DT, F, terminator_block);
-
 
   errs() << "Dominators of : " << terminator_block->getName() << "\n";
   for (auto dominator : dominators_of_terminator) {
