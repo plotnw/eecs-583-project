@@ -57,49 +57,12 @@ static cl::opt<bool>
                    cl::Hidden,
                    cl::desc("Consider alignment while matching instructions"));
 
+
 static std::string demangle(const char *name) {
   int status = -1;
   std::unique_ptr<char, void (*)(void *)> res{
       abi::__cxa_demangle(name, NULL, NULL, &status), std::free};
   return (status == 0) ? res.get() : std::string(name);
-}
-
-Optional<BasicBlock *> findTerminatorBlock(Function &F) {
-  BasicBlock *terminator_candidate = nullptr;
-  for (BasicBlock &BB : F) {
-    if (isa<ReturnInst>(BB.getTerminator())) {
-      if (terminator_candidate == nullptr) {
-        terminator_candidate = &BB;
-      } else {
-        return Optional<BasicBlock *>();
-      }
-    }
-  }
-  if (terminator_candidate == nullptr) {
-    return Optional<BasicBlock *>();
-  } else {
-    return Optional<BasicBlock *>(terminator_candidate);
-  }
-}
-
-std::vector<BasicBlock *> findDominators(DominatorTree *DT, Function &F, BasicBlock *target_BB) {
-  std::vector<BasicBlock *> dominators;
-  for (BasicBlock &BB : F) {
-    auto inst_node = DT->getNode(&BB);
-
-    if (inst_node) {
-        for (auto child : inst_node->children()) {
-          BasicBlock *dominated_BB = child->getBlock();
-          if (dominated_BB == target_BB) {
-            dominators.push_back(inst_node->getBlock());
-          }
-      }
-    }
-    else {
-      errs() << "Unreachable block: " << BB.getName() << "\n";
-    }
-  }
-  return dominators;
 }
 
 /// \returns True if all of the values in \p VL are constants (but not
@@ -1249,8 +1212,8 @@ private:
 
 class LoopRollerCFG {
 public:
-  LoopRollerCFG(Function &F, ScalarEvolution *SE, DominatorTree *DT)
-      : F(F), SE(SE), DT(DT), NumAttempts(0), NumRolledLoops(0) {}
+  LoopRollerCFG(Function &F, ScalarEvolution *SE, DominatorTree *DT, LoopInfo * LI)
+      : F(F), SE(SE), DT(DT), LI(LI), NumAttempts(0), NumRolledLoops(0) {}
 
   bool run();
 
@@ -1258,6 +1221,7 @@ private:
   Function &F;
   ScalarEvolution *SE;
   DominatorTree *DT;
+  LoopInfo *LI;
   unsigned NumAttempts;
   unsigned NumRolledLoops;
 
@@ -3646,6 +3610,86 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB) {
   return Changed;
 }
 
+const u_int MAX_DOMINATOR_UNROLL_DEPTH = 32;
+
+Optional<BasicBlock *> findTerminatorBlock(Function &F) {
+  BasicBlock *terminator_candidate = nullptr;
+  for (BasicBlock &BB : F) {
+    if (isa<ReturnInst>(BB.getTerminator())) {
+      if (terminator_candidate == nullptr) {
+        terminator_candidate = &BB;
+      } else {
+        return Optional<BasicBlock *>();
+      }
+    }
+  }
+  if (terminator_candidate == nullptr) {
+    return Optional<BasicBlock *>();
+  } else {
+    return Optional<BasicBlock *>(terminator_candidate);
+  }
+}
+
+//
+std::vector<BasicBlock *> findDominators(DominatorTree *DT, Function &F, BasicBlock *target_BB, BasicBlock *top_bb) 
+{
+  std::vector<BasicBlock *> dominators;
+
+  DomTreeNodeBase<llvm::BasicBlock> *target_node = DT->getNode(target_BB);
+  if (target_node) {
+    DomTreeNodeBase<llvm::BasicBlock> *curr_idom = target_node->getIDom();
+    DomTreeNodeBase<llvm::BasicBlock> *prev_idom = target_node;
+    int depth = 0;
+
+    while(depth < MAX_DOMINATOR_UNROLL_DEPTH &&
+          curr_idom && 
+          curr_idom->getBlock() != top_bb && 
+          curr_idom->getBlock() != prev_idom->getBlock()) {
+      dominators.push_back(curr_idom->getBlock());
+      prev_idom = curr_idom;
+      curr_idom = curr_idom->getIDom();
+      depth++;
+    }
+  }
+  else {
+    errs() << "Target block: " << target_BB << " not reachable!\n";
+  }
+  return dominators;
+}
+
+
+BasicBlock* mergeBasicBlocks(std::vector<BasicBlock *> & basic_blocks) {
+  if (basic_blocks.empty()) {
+    return nullptr;
+  }
+
+  BasicBlock* first_dominator = basic_blocks.front();
+  BasicBlock* merged_block = BasicBlock::Create(
+    first_dominator->getContext(), 
+    "mergedDominators", 
+    first_dominator->getParent()
+  );
+
+  IRBuilder<> builder(merged_block);
+  
+  llvm::ValueToValueMapTy vmap;
+  
+  for (BasicBlock *bb : basic_blocks) {
+    for (Instruction &inst : *bb) {
+        Instruction* cloned_inst = inst.clone();
+        vmap[&inst] = WeakTrackingVH(cloned_inst);
+        builder.Insert(cloned_inst);
+      
+    }
+  }
+  for (Instruction &inst : *merged_block) {
+    llvm::RemapInstruction(&inst, vmap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+  }
+
+  return merged_block;
+}
+
+
 bool LoopRollerCFG::run() {
   std::vector<BasicBlock *> Blocks;
   for (BasicBlock &BB : F)
@@ -3654,27 +3698,58 @@ bool LoopRollerCFG::run() {
   errs() << "Attempting to Optimize: " << F.getName() << "\n";
   // F.dump();
 
-  Optional<BasicBlock *> terminator_block_check = findTerminatorBlock(F);
-  if (!terminator_block_check.hasValue()) {
-    errs() << "Aborting optimization - No terminator block found in: "
-           << F.getName() << "\n";
+  // Optional<BasicBlock *> terminator_block_check = findTerminatorBlock(F);
+  // if (!terminator_block_check.hasValue()) {
+  //   errs() << "Aborting optimization - No terminator block found in: "
+  //          << F.getName() << "\n";
+  //   return false;
+  // }
+
+  // BasicBlock *terminator_block = terminator_block_check.getValue();
+
+  // We only take care of the case where the function consists mostly of
+  // a single perfectly double nested loop, this gets the inner loop
+  std::vector<Loop *> curr_loops = LI->getTopLevelLoops();
+  // currently only take of cases with a single doubly nested loop
+  
+  errs() << "# of loops: " << curr_loops.size() << "\n";
+  if (curr_loops.size() != 1){
+    errs() << "more than 1 top level loop\n";
     return false;
   }
+  
+  Loop *curr_outer_loop = curr_loops.front();
+  std::vector<Loop *> curr_inner_loops = curr_outer_loop->getSubLoops();
+  if (curr_inner_loops.size() != 1){
+    errs() << "more than 1 inner level loop\n";
+    return false;
+  }
+  Loop *curr_inner_loop = curr_inner_loops.front();
+  BasicBlock *curr_preheader = curr_inner_loop->getLoopPreheader();
+  BasicBlock *curr_exit_block = curr_inner_loop->getExitingBlock();
 
-  BasicBlock *terminator_block = terminator_block_check.getValue();
-  std::vector<BasicBlock*> dominators_of_terminator = findDominators(DT, F, terminator_block);
+  std::vector<BasicBlock*> dominators_of_terminator = findDominators(DT, F, curr_exit_block, curr_preheader);
+  reverse(dominators_of_terminator.begin(), dominators_of_terminator.end());
 
-  errs() << "Dominators of : " << terminator_block->getName() << "\n";
+  errs() << "Dominators of : " << curr_exit_block->getName() << "\n";
   for (auto dominator : dominators_of_terminator) {
     errs() << "\t - " << dominator->getName() << "\n";
   }
+
+  BasicBlock* merged_basic_blocks = mergeBasicBlocks(dominators_of_terminator);
+
+  errs() << "Printout out merged_basic_blocks" << "\n";
+  for (Instruction &inst : *merged_basic_blocks) {
+    errs() << inst << "\n";
+  }
+  errs() << "-------------\n";
 
   bool Changed = false;
 
   for (BasicBlock *BB : Blocks) {
     errs() << "BlockSize: " << BB->size() << "\n";
     collectSeedInstructions(*BB);
-    Changed = Changed || attemptRollingSeeds(*BB);
+    Changed = Changed;
   }
 #ifdef TEST_DEBUG
   errs() << "Done Loop Roller: " << NumRolledLoops << "/" << NumAttempts
@@ -3687,8 +3762,8 @@ bool LoopRollerCFG::run() {
 }
 
 bool LoopRollingCFG::runImpl(Function &F, ScalarEvolution *SE,
-                             DominatorTree *DT) {
-  LoopRollerCFG RL(F, SE, DT);
+                             DominatorTree *DT, LoopInfo *LI) {
+  LoopRollerCFG RL(F, SE, DT, LI);
   return RL.run();
 }
 
@@ -3696,7 +3771,8 @@ PreservedAnalyses LoopRollingCFG::run(Function &F,
                                       FunctionAnalysisManager &AM) {
   auto *SE = &AM.getResult<ScalarEvolutionAnalysis>(F);
   auto *DT = &AM.getResult<DominatorTreeAnalysis>(F);
-  bool Changed = runImpl(F, SE, DT);
+  auto *LI = &AM.getResult<LoopAnalysis>(F);
+  bool Changed = runImpl(F, SE, DT, LI);
   if (!Changed)
     return PreservedAnalyses::all();
   PreservedAnalyses PA;
@@ -3727,13 +3803,15 @@ public:
     // F.dump();
     auto *SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
     auto *DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    auto *LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
-    return Impl.runImpl(F, SE, DT);
+    return Impl.runImpl(F, SE, DT, LI);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<ScalarEvolutionWrapperPass>();
     AU.addRequired<DominatorTreeWrapperPass>();
+    AU.addRequired<LoopInfoWrapperPass>();
   }
 
 private:

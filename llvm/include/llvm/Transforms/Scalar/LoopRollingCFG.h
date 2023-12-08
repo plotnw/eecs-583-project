@@ -25,7 +25,7 @@ public:
   /// Run the pass over the function.
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
-  bool runImpl(Function &F, ScalarEvolution *SE, DominatorTree *DT);
+  bool runImpl(Function &F, ScalarEvolution *SE, DominatorTree *DT, LoopInfo *LI);
 };
 
 } // end namespace llvm
