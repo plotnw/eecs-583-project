@@ -40,7 +40,7 @@
 
 #define DEBUG_TYPE "loop-rolling"
 
-#define TEST_DEBUG
+#define TEST_DEBUG True
 
 using namespace llvm;
 
@@ -60,6 +60,7 @@ static cl::opt<bool>
 
 static std::string demangle(const char *name) {
   int status = -1;
+  
   std::unique_ptr<char, void (*)(void *)> res{
       abi::__cxa_demangle(name, NULL, NULL, &status), std::free};
   return (status == 0) ? res.get() : std::string(name);
@@ -85,6 +86,7 @@ static Value *isConstantSequence(const std::vector<ValueT *> VL) {
 
   APInt Last = CInt->getValue();
   ConstantInt *Step = nullptr;
+  
   for (unsigned i = 1; i < VL.size(); i++) {
     if (VL[0]->getType() != VL[i]->getType())
       return nullptr;
@@ -867,6 +869,8 @@ public:
   std::unordered_set<Value *> ValuesInNode;
   std::unordered_set<Value *> Inputs;
 
+  std::unordered_map<Value *, Value *> cloned_instruction_to_original;
+
   AlignedGraphCFG(Node *N, BasicBlock &BB, ScalarEvolution *SE = nullptr)
       : BB(&BB), SE(SE) {
     Root = N;
@@ -890,8 +894,9 @@ public:
 
   template <typename ValueT>
   AlignedGraphCFG(std::vector<ValueT *> &Vs, BasicBlock &BB,
+                  std::unordered_map<Value *, Value *> &cloned_instruction_to_original,
                   ScalarEvolution *SE = nullptr)
-      : BB(&BB), SE(SE) {
+      : BB(&BB), SE(SE), cloned_instruction_to_original(cloned_instruction_to_original) {
     Root = createNode(Vs, BB);
     addNode(Root);
     std::set<Node *> Visited;
@@ -1090,7 +1095,8 @@ private:
                                      Node *Parent);
   template <typename ValueT>
   Node *buildBinOpSequenceNode(std::vector<ValueT *> &VL, BasicBlock &BB,
-                               Node *Parent);
+                               Node *Parent,
+                               std::unordered_map<Value *, Value *> &cloned_instruction_to_original);
   template <typename ValueT>
   Node *buildRecurrenceNode(std::vector<ValueT *> &VL, BasicBlock &BB,
                             Node *Parent);
@@ -1123,17 +1129,26 @@ public:
 
 class SeedGroups {
 public:
+  // Tracks parallel branches
+  std::vector<Instruction *> Branches;
+  
   std::unordered_map<Value *, std::vector<Instruction *>> Stores;
   std::unordered_map<Value *, std::vector<Instruction *>> Calls;
   std::unordered_map<BinaryOperator *, Instruction *> Reductions;
 
   void clear() {
+    Branches.clear();
     Stores.clear();
     Calls.clear();
     Reductions.clear();
   }
 
   void remove(Instruction *I) {
+    auto it = std::find(Branches.begin(), Branches.end(), I);
+    if (it != Branches.end()) {
+      Branches.erase(it);
+    }
+
     for (auto &Pair : Stores) {
       Pair.second.erase(std::remove(Pair.second.begin(), Pair.second.end(), I),
                         Pair.second.end());
@@ -1156,6 +1171,10 @@ public:
   }
 
   std::vector<Instruction *> *getGroupWith(Instruction *I) {
+    if (std::find(Branches.begin(), Branches.end(), I) != 
+        Branches.end()) {
+      return &(Branches);
+    }
     for (auto &Pair : Stores) {
       if (std::find(Pair.second.begin(), Pair.second.end(), I) !=
           Pair.second.end())
@@ -1225,8 +1244,12 @@ private:
   unsigned NumAttempts;
   unsigned NumRolledLoops;
 
+  void collectSeedInstructionsAndBranches(BasicBlock &BB);
   void collectSeedInstructions(BasicBlock &BB);
-  bool attemptRollingSeeds(BasicBlock &BB);
+  bool attemptRollingBranches(BasicBlock &BB, AlignedGraphCFG *&G, 
+                              std::unordered_map<Value *, Value *> &cloned_instruction_to_original);
+  bool attemptRollingSeeds(BasicBlock &BB,
+                           std::unordered_map<Value *, Value *> &cloned_instruction_to_original);
   // void codeGeneration(Tree &T, BasicBlock &BB);
 
   SeedGroups Seeds;
@@ -1349,23 +1372,23 @@ Node *AlignedGraphCFG::buildReduction(ValueT *V, Instruction *U, BasicBlock &BB,
   if (BOs.size() <= 1)
     return nullptr;
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   errs() << "BOs:\n";
   for (auto *V : BOs)
     V->dump();
   errs() << "Operands:\n";
   for (auto *V : Vs)
     V->dump();
-#endif
+    #endif
 
   ReorderOperands(Vs, BB);
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   errs() << "Operands:\n";
   for (auto *V : Vs)
     V->dump();
   errs() << "ReductionNode\n";
-#endif
+    #endif
 
   if (PHI)
     Inputs.insert(PHI);
@@ -1593,20 +1616,35 @@ Node *AlignedGraphCFG::buildAlternatingSequenceNode(std::vector<ValueT *> &VL,
   return new AlternatingSequenceNode(VL, First, Second, BB, Parent);
 }
 
-static bool isAddition(Instruction *I, ScalarEvolution *SE) {
+static bool isAddition(Instruction *I, ScalarEvolution *SE,
+                       std::unordered_map<Value *, Value *> &cloned_instruction_to_original) {
   if (I->getOpcode() == Instruction::Add)
     return true;
   if (I->getOpcode() == Instruction::Or) {
-    // errs() << "Checking if represents addition:"; I->dump();
+    errs() << "Checking if represents addition:"; I->dump();
 
     Value *Op1 = I->getOperand(0);
-    ConstantInt *Op2 = dyn_cast<ConstantInt>(I->getOperand(1));
+    Value *Op2_raw = I->getOperand(1);
+    auto Op2_original = cloned_instruction_to_original.find(Op2_raw);
+    if (Op2_original == cloned_instruction_to_original.end()) {
+      errs() << "Cannot find original instruction for: " << *Op2_raw << "\n";
+      return false;
+    }
+    ConstantInt *Op2 = dyn_cast<ConstantInt>(Op2_original->second);
     if (Op2 == nullptr)
       return false;
     if (!isa<PHINode>(Op1))
       return false;
 
-    auto *AddRec = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(Op1));
+    auto Op1_original = cloned_instruction_to_original.find(Op1);
+    if (Op1_original == cloned_instruction_to_original.end()) {
+      errs() << "Cannot find original instruction for: " << *Op1 << "\n";
+      return false;
+    }
+
+    errs() << "Aliasing: " << *Op1 << " to: " << *(Op1_original->second) << "\n";
+
+    auto *AddRec = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(Op1_original->second));
     if (AddRec == nullptr)
       return false;
     // errs() << "SCEV:"; AddRec->dump();
@@ -1638,9 +1676,10 @@ static bool isAddition(Instruction *I, ScalarEvolution *SE) {
   return false;
 }
 
-static bool isEquivalent(Instruction *I, unsigned opcode, ScalarEvolution *SE) {
+static bool isEquivalent(Instruction *I, unsigned opcode, ScalarEvolution *SE,
+                         std::unordered_map<Value *, Value *> &cloned_instruction_to_original) {
   if (SE && opcode == Instruction::Add)
-    return isAddition(I, SE);
+    return isAddition(I, SE, cloned_instruction_to_original);
   return (I->getOpcode() == opcode);
 }
 
@@ -1665,7 +1704,8 @@ no carry is needed in the binary addition.
 */
 template <typename ValueT>
 Node *AlignedGraphCFG::buildBinOpSequenceNode(std::vector<ValueT *> &VL,
-                                              BasicBlock &BB, Node *Parent) {
+                                              BasicBlock &BB, Node *Parent,
+                                              std::unordered_map<Value *, Value *> &cloned_instruction_to_original) {
   errs() << "BinOP?\n";
   VL[0]->dump();
 
@@ -1700,7 +1740,7 @@ Node *AlignedGraphCFG::buildBinOpSequenceNode(std::vector<ValueT *> &VL,
     // if (BinOp==nullptr || BinOp->getParent()!=(&BB))
 
     // if (BinOp==nullptr || BinOp->getOpcode()!=MaxOpcode) {
-    if (BinOp == nullptr || (!isEquivalent(BinOp, MaxOpcode, SE))) {
+    if (BinOp == nullptr || (!isEquivalent(BinOp, MaxOpcode, SE, cloned_instruction_to_original))) {
       LeftOperands.push_back(VL[i]);
       RightOperands.push_back(nullptr);
       continue;
@@ -1937,7 +1977,7 @@ Node *AlignedGraphCFG::createNode(std::vector<ValueT *> Vs, BasicBlock &BB,
     return N;
   }
 
-  if (Node *N = buildBinOpSequenceNode(Vs, BB, Parent)) {
+  if (Node *N = buildBinOpSequenceNode(Vs, BB, Parent, cloned_instruction_to_original)) {
     errs() << "BinOp Seq\n";
     return N;
   }
@@ -2123,9 +2163,9 @@ bool AlignedGraphCFG::isSchedulable(BasicBlock &BB) {
   std::unordered_set<Value *> Visited;
   for (auto *V : Inputs) {
     if (invalidDependence(V, Visited)) {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
       errs() << "Invalid dependence found!\n";
-#endif
+    #endif
       return false;
     }
   }
@@ -2251,10 +2291,10 @@ void CodeGeneratorCFG::generateExtract(Node *N, Instruction *NewI,
       continue;
     for (auto *U : I->users()) {
       if (!G.contains(U)) {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
         errs() << "Found use: " << i << ": ";
         U->dump();
-#endif
+    #endif
         NeedExtract.insert(i);
         break;
       }
@@ -2264,10 +2304,10 @@ void CodeGeneratorCFG::generateExtract(Node *N, Instruction *NewI,
   if (NeedExtract.empty())
     return;
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   errs() << "Extracting: ";
   NewI->dump();
-#endif
+    #endif
 
   if (NeedExtract.size() == 1 && N->getNodeType() == NodeType::REDUCTION) {
     ReductionNode *RN = (ReductionNode *)N;
@@ -2306,7 +2346,7 @@ Value *CodeGeneratorCFG::generateMismatchingCode(std::vector<Value *> &VL,
   Module *M = F.getParent();
   LLVMContext &Context = F.getContext();
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   errs() << "Mismatched Values:\n";
   for (Value *V : VL) {
     if (isa<Instruction>(V))
@@ -2324,7 +2364,7 @@ Value *CodeGeneratorCFG::generateMismatchingCode(std::vector<Value *> &VL,
 
     V->dump();
   }
-#endif
+    #endif
 
   bool AllSame = true;
   for (unsigned i = 0; i < VL.size(); i++) {
@@ -2434,26 +2474,26 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
 
   switch (N->getNodeType()) {
   case NodeType::IDENTICAL: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating IDENTICAL\n";
-#endif
+    #endif
     return N->getValue(0);
   }
   case NodeType::MULTI: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating MULTI\n";
-#endif
+    #endif
     for (unsigned i = 0; i < N->getNumChildren(); i++) {
       cloneGraph(N->getChild(i), Builder);
     }
     return nullptr; // there is no single value to return
   }
   case NodeType::MATCH: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating MATCH\n";
-#endif
+    #endif
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Match: ";
     if (isa<Function>(N->getValue(0))) {
       errs() << N->getValue(0)->getName() << "\n";
@@ -2462,7 +2502,7 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
       for (auto *V : N->getValues())
         V->dump();
     }
-#endif
+    #endif
     Instruction *I = dyn_cast<Instruction>(N->getValue(0));
     if (I) {
       Instruction *NewI = I->clone();
@@ -2476,9 +2516,9 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
         Operands.push_back(cloneGraph(N->getChild(i), Builder));
       }
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
       errs() << "Operands done!\n";
-#endif
+    #endif
 
       SmallVector<std::pair<unsigned, MDNode *>, 8> MDs;
       NewI->getAllMetadata(MDs);
@@ -2500,10 +2540,10 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
       for (unsigned i = 0; i < NewI->getNumOperands(); i++) {
         NewI->setOperand(i, Operands[i]);
       }
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
       errs() << "Generated: ";
       NewI->dump();
-#endif
+    #endif
 
       for (unsigned i = 0; i < N->size(); i++) {
         if (auto *I = N->getValidInstruction(i)) {
@@ -2515,20 +2555,20 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
 
       generateExtract(N, NewI, Builder);
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
       errs() << "Gen: ";
       NewI->dump();
-#endif
+    #endif
       return NewI;
     } else
       return N->getValue(0); // TODO: maybe an assert false
   }
   case NodeType::CONSTEXPR: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating CONSTEXPR\n";
-#endif
+    #endif
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Matching ConstExpr: ";
     if (isa<Function>(N->getValue(0))) {
       errs() << N->getValue(0)->getName() << "\n";
@@ -2537,7 +2577,7 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
       for (auto *V : N->getValues())
         V->dump();
     }
-#endif
+    #endif
     auto *I = dyn_cast<ConstantExpr>(N->getValue(0));
     if (I) {
       Instruction *NewI = I->getAsInstruction();
@@ -2574,19 +2614,19 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
       generateExtract(N, NewI, Builder);
       */
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
       errs() << "Generated: ";
       NewI->dump();
-#endif
+    #endif
 
       return NewI;
     } else
       return N->getValue(0); // TODO: maybe an assert false
   }
   case NodeType::GEPSEQ: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating GEPSEQ\n";
-#endif
+    #endif
     auto *GN = (GEPSequenceNode *)N;
 
     Value *Ptr = GN->getPointerOperand();
@@ -2604,9 +2644,9 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
 
     assert(GN->getNumChildren() && "Expected child with indices!");
     Value *IndVarIdx = cloneGraph(GN->getChild(0), Builder);
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Closing GEPSEQ\n";
-#endif
+    #endif
     // auto *GEP =
     // dyn_cast<Instruction>(Builder.CreateGEP(GN->getPointerOperand(),
     // IndVarIdx));
@@ -2631,25 +2671,25 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
 
     generateExtract(N, GEP, Builder);
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Gen: ";
     GEP->dump();
-#endif
+    #endif
     return GEP;
   }
   case NodeType::BINOP: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating BINOP\n";
-#endif
+    #endif
     auto *BON = (BinOpSequenceNode *)N;
 
     assert(BON->getNumChildren() && "Expected child with varying operands!");
     Value *Op0 = cloneGraph(BON->getChild(0), Builder);
     Value *Op1 = cloneGraph(BON->getChild(1), Builder);
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Closing BINOP\n";
-#endif
+    #endif
     Instruction *NewI = BON->getReference()->clone();
     for (unsigned i = 0; i < NewI->getNumOperands(); i++) {
       NewI->setOperand(i, nullptr);
@@ -2672,16 +2712,16 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
 
     generateExtract(N, NewI, Builder);
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Gen: ";
     NewI->dump();
-#endif
+    #endif
     return NewI;
   }
   case NodeType::RECURRENCE: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating RECURRENCE\n";
-#endif
+    #endif
     auto *RN = (RecurrenceNode *)N;
 
     PHINode *PHI = nullptr;
@@ -2695,24 +2735,24 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
     PHI->addIncoming(RN->getStartValue(), PreHeader);
     NodeToValue[N] = PHI;
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Gen: ";
     PHI->dump();
-#endif
+    #endif
 
     return PHI;
   }
   case NodeType::REDUCTION: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating REDUCTION\n";
-#endif
+    #endif
     auto *RN = (ReductionNode *)N;
 
     assert(RN->getNumChildren() && "Expected child with varying operands!");
     Value *Op = cloneGraph(RN->getChild(0), Builder);
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Closing REDUCTION\n";
-#endif
+    #endif
     Instruction *NewI = RN->getBinaryOperator()->clone();
     for (unsigned i = 0; i < NewI->getNumOperands(); i++) {
       NewI->setOperand(i, nullptr);
@@ -2754,16 +2794,16 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
     Extracted[RN->getBinaryOperator()] = NewI; // PHI;
     generateExtract(N, NewI, Builder);
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Gen: ";
     NewI->dump();
-#endif
+    #endif
     return NewI;
   }
   case NodeType::INTSEQ: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating INTSEQ\n";
-#endif
+    #endif
 
     Value *NewV = nullptr;
 
@@ -2799,17 +2839,17 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
       NewV = Add;
     }
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Gen: ";
     NewV->dump();
-#endif
+    #endif
     NodeToValue[N] = NewV;
     return NewV;
   }
   case NodeType::ALTSEQ: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating ALTSEQ\n";
-#endif
+    #endif
 
     auto *ASN = (AlternatingSequenceNode *)N;
 
@@ -2972,14 +3012,14 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
     return NewV;
   }
   case NodeType::MISMATCH: {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Generating Mismatch\n";
-#endif
+    #endif
     Value *NewV = generateMismatchingCode(N->getValues(), Builder);
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Gen: ";
     NewV->dump();
-#endif
+    #endif
     NodeToValue[N] = NewV;
     return NewV;
   }
@@ -3023,16 +3063,16 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
   Exit = BasicBlock::Create(Context, "rolled.exit", BB.getParent());
 
   errs() << "Loop Rolling: " << BB.getParent()->getName() << "\n";
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   errs() << "Generating tree\n";
-#endif
+    #endif
   for (Node *N : G.SchedulingOrder) {
     cloneGraph(N, Builder);
   }
   cloneGraph(G.Root, Builder);
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   errs() << "Graph code generated!\n";
-#endif
+    #endif
 
   bool HasRecurrence = false;
   int HasMismatch = 0;
@@ -3050,12 +3090,12 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
     }
   }
 
-#ifdef TEST_DEBUG
+        #ifdef TEST_DEBUG
   errs() << "Root:\n";
   for (auto *V : G.Root->getValues())
     V->dump();
   errs() << "Root size: " << G.Root->size() << "\n";
-#endif
+    #endif
 
   auto *Add = Builder.CreateAdd(IndVar, ConstantInt::get(IndVarTy, 1));
   CreatedCode.push_back(Add);
@@ -3111,9 +3151,9 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
     // F.getParent()->getSourceFileName() + std::string(".") +
     // F.getName().str(); FileName += "." + BB.getName().str() + ".dot";
     // G.writeDotFile(FileName);
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     // BB.dump();
-#endif
+    #endif
 
     IndVar->addIncoming(ConstantInt::get(IndVarTy, 0), PreHeader);
     IndVar->addIncoming(Add, Header);
@@ -3191,7 +3231,7 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
       }
     }
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
     errs() << "Done!\n";
 
     // BB.dump();
@@ -3218,7 +3258,7 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
     errs() << "REDUCTION: " << NodeFreq[NodeType::REDUCTION] << "\n";
     errs() << "RECURRENCE: " << NodeFreq[NodeType::RECURRENCE] << "\n";
     errs() << "MULTI: " << NodeFreq[NodeType::MULTI] << "\n";
-#endif
+    #endif
     if (verifyFunction(*BB.getParent())) {
       errs() << "Broken Function!!\n";
       BB.getParent()->dump();
@@ -3235,9 +3275,9 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
 }
 
 static BinaryOperator *getPossibleReduction(Value *V) {
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   // errs() << "looking for reduction\n";
-#endif
+    #endif
   if (V == nullptr)
     return nullptr;
   BinaryOperator *BO = dyn_cast<BinaryOperator>(V);
@@ -3259,6 +3299,26 @@ static BinaryOperator *getPossibleReduction(Value *V) {
   return BO;
 }
 
+void LoopRollerCFG::collectSeedInstructionsAndBranches(BasicBlock &BB) {
+  Seeds.clear();
+  for (Instruction &I : BB) {
+    if (auto *BI = dyn_cast<BranchInst>(&I)) {
+      // For now, we are assuming anytime we see multiple branches in a BB
+      // it was the result of us merging a basic block, and so in particular
+      // the branches are intended to be rolled together. We don't actually
+      // check this property, so the pass will fail for complicated CFGs
+      // and branches with non-matching condition codes.
+
+      // But since we made this function and intend to call only in the 
+      // situations we want to do branches, it should be fine
+      
+      Seeds.Branches.emplace_back(BI);
+    }
+      // we also are not intending to support reduction trees, so we remove the code for that here
+  }
+     
+}
+
 void LoopRollerCFG::collectSeedInstructions(BasicBlock &BB) {
   // Initialize the collections. We will make a single pass over the block.
   Seeds.clear();
@@ -3270,37 +3330,36 @@ void LoopRollerCFG::collectSeedInstructions(BasicBlock &BB) {
     // Ignore store instructions that are volatile or have a pointer operand
     // that doesn't point to a scalar type.
     if (auto *SI = dyn_cast<StoreInst>(&I)) {
-      // if (!SI->isSimple())
-      //   continue;
-      // if (!isValidElementType(SI->getValueOperand()->getType()))
-      //   continue;
+      //if (!SI->isSimple())
+      //  continue;
+      //if (!isValidElementType(SI->getValueOperand()->getType()))
+      //  continue;
       auto &Stores = Seeds.Stores[getUnderlyingObject(SI->getPointerOperand())];
-
+      
       bool Valid = true;
       if (Stores.size()) {
-        Valid = false;
+	Valid = false;
         auto *RefSI = dyn_cast<StoreInst>(Stores[0]);
-        if (RefSI && RefSI->getValueOperand()->getType() ==
-                         SI->getValueOperand()->getType())
-          Valid = true;
+	if (RefSI && RefSI->getValueOperand()->getType()==SI->getValueOperand()->getType())
+	  Valid = true;
       }
-      if (Valid)
-        Stores.push_back(SI);
+      if (Valid) Stores.push_back(SI);
 
       if (BinaryOperator *BO = getPossibleReduction(SI->getValueOperand())) {
-#ifdef TEST_DEBUG
-        // errs() << "Possible reduction\n";
-        // BO->dump();
-#endif
+  #ifdef TEST_DEBUG
+        //errs() << "Possible reduction\n";
+	//BO->dump();
+  #endif
         Seeds.Reductions[BO] = &I;
       }
-    } else if (auto *CI = dyn_cast<CallInst>(&I)) {
-      // if (CI->getNumUses()>0) continue;
+    }
+    else if (auto *CI = dyn_cast<CallInst>(&I)) {
+      //if (CI->getNumUses()>0) continue;
       Function *Callee = CI->getCalledFunction();
       if (Callee) {
         bool Valid = !Callee->isVarArg();
         if (Intrinsic::ID ID = (Intrinsic::ID)Callee->getIntrinsicID()) {
-          switch (ID) {
+          switch(ID) {
           case Intrinsic::lifetime_start:
           case Intrinsic::lifetime_end:
             Valid = false;
@@ -3311,54 +3370,58 @@ void LoopRollerCFG::collectSeedInstructions(BasicBlock &BB) {
           Seeds.Calls[Callee].push_back(CI);
         }
       }
-      for (unsigned i = 0; i < CI->getNumArgOperands(); i++) {
+      for (unsigned i = 0; i<CI->getNumArgOperands(); i++) {
         if (BinaryOperator *BO = getPossibleReduction(CI->getArgOperand(i))) {
-#ifdef TEST_DEBUG
-          // errs() << "Possible reduction\n";
-          // BO->dump();
-#endif
+  #ifdef TEST_DEBUG
+          //errs() << "Possible reduction\n";
+	  //BO->dump();
+  #endif
           Seeds.Reductions[BO] = &I;
         }
       }
-    } else if (auto *CB = dyn_cast<CallBase>(&I)) {
-      for (unsigned i = 0; i < CB->getNumArgOperands(); i++) {
+    }
+    else if (auto *CB = dyn_cast<CallBase>(&I)) {
+      for (unsigned i = 0; i<CB->getNumArgOperands(); i++) {
         if (BinaryOperator *BO = getPossibleReduction(CB->getArgOperand(i))) {
-#ifdef TEST_DEBUG
-          // errs() << "Possible reduction\n";
-          // BO->dump();
-#endif
+  #ifdef TEST_DEBUG
+          //errs() << "Possible reduction\n";
+	  //BO->dump();
+  #endif
           Seeds.Reductions[BO] = &I;
         }
       }
-    } else if (auto *Br = dyn_cast<BranchInst>(&I)) {
+    }
+    else if (auto *Br = dyn_cast<BranchInst>(&I)) {
       if (Br->isConditional()) {
         if (BinaryOperator *BO = getPossibleReduction(Br->getCondition())) {
-#ifdef TEST_DEBUG
-          // errs() << "Possible reduction\n";
-          // BO->dump();
-#endif
+  #ifdef TEST_DEBUG
+          //errs() << "Possible reduction\n";
+	  //BO->dump();
+  #endif
           Seeds.Reductions[BO] = &I;
         }
       }
-    } else if (auto *Ret = dyn_cast<ReturnInst>(&I)) {
+    }
+    else if (auto *Ret = dyn_cast<ReturnInst>(&I)) {
       if (BinaryOperator *BO = getPossibleReduction(Ret->getReturnValue())) {
-#ifdef TEST_DEBUG
-        // errs() << "Possible reduction\n";
-        // BO->dump();
-#endif
+  #ifdef TEST_DEBUG
+        //errs() << "Possible reduction\n";
+	//BO->dump();
+  #endif
         Seeds.Reductions[BO] = &I;
       }
-    } else if (auto *PHI = dyn_cast<PHINode>(&I)) {
-      // if (PHI->getNumIncomingValues()!=2) continue;
+    }
+    else if (auto *PHI = dyn_cast<PHINode>(&I)) {
+      //if (PHI->getNumIncomingValues()!=2) continue;
       PHI->dump();
-      if (PHI->getBasicBlockIndex(PHI->getParent()) >= 0) {
+      if (PHI->getBasicBlockIndex(PHI->getParent())>=0) {
         Value *V = PHI->getIncomingValueForBlock(PHI->getParent());
-        V->dump();
+	V->dump();
         if (BinaryOperator *BO = getPossibleReduction(V)) {
-#ifdef TEST_DEBUG
+  #ifdef TEST_DEBUG
           errs() << "Possible reduction\n";
-          BO->dump();
-#endif
+	  BO->dump();
+  #endif
           Seeds.Reductions[BO] = &I;
         }
       }
@@ -3381,7 +3444,35 @@ void LoopRollerCFG::collectSeedInstructions(BasicBlock &BB) {
   }
 }
 
-bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB) {
+bool LoopRollerCFG::attemptRollingBranches(BasicBlock &BB, AlignedGraphCFG *&G,
+  std::unordered_map<Value *, Value *> &cloned_instruction_to_original) {
+  if (G != nullptr) {
+    errs() << "attemptRollingBranches got non-null G, ur doing something wrong\n";
+    return false;
+  }
+  bool Changed = false;
+  if (!Seeds.Branches.empty()) {
+      G = new AlignedGraphCFG(Seeds.Branches, BB, cloned_instruction_to_original, SE);
+      /*
+      if (G.isSchedulable(BB)) {
+        NumAttempts++;
+        CodeGeneratorCFG CG(F, BB, G);
+        bool HasRolled = CG.generate(Seeds);
+        Changed = Changed || HasRolled;
+        if (HasRolled)
+          NumRolledLoops++;
+      } else {
+        errs() << G.getDotString() << "\n";
+        // BB.dump();
+      }
+      G.destroy();
+      */
+    }
+  return Changed;
+}
+
+bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB, 
+                                        std::unordered_map<Value *, Value *> &cloned_instruction_to_original) {
   bool Changed = false;
 
   for (auto &Pair : Seeds.Stores) {
@@ -3491,9 +3582,9 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB) {
     }
   }
 
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   // errs() << "stores\n";
-#endif
+    #endif
   for (auto &Pair : Seeds.Stores) {
     if (Pair.second.size() > 1) {
       std::vector<Instruction *> SavedInsts;
@@ -3504,7 +3595,7 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB) {
         Attempt = false;
         bool HasRolled = false;
         if (StoreInsts.size() > 1) {
-          AlignedGraphCFG G(StoreInsts, BB, SE);
+          AlignedGraphCFG G(StoreInsts, BB, cloned_instruction_to_original, SE);
           if (G.isSchedulable(BB)) {
             NumAttempts++;
             CodeGeneratorCFG CG(F, BB, G);
@@ -3548,9 +3639,9 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB) {
       }
     }
   }
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   // errs() << "reductions (terminators)\n";
-#endif
+    #endif
   for (auto &Pair : Seeds.Reductions) {
     if (Pair.second == nullptr)
       continue;
@@ -3567,12 +3658,12 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB) {
     }
     G.destroy();
   }
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   // errs() << "calls\n";
-#endif
+    #endif
   for (auto &Pair : Seeds.Calls) {
     if (Pair.second.size() > 1) {
-      AlignedGraphCFG G(Pair.second, BB, SE);
+      AlignedGraphCFG G(Pair.second, BB, cloned_instruction_to_original, SE);
       if (G.isSchedulable(BB)) {
         NumAttempts++;
         CodeGeneratorCFG CG(F, BB, G);
@@ -3587,9 +3678,9 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB) {
       G.destroy();
     }
   }
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   // errs() << "reductions (non-terminators)\n";
-#endif
+    #endif
   for (auto &Pair : Seeds.Reductions) {
     if (Pair.second == nullptr)
       continue;
@@ -3658,7 +3749,8 @@ std::vector<BasicBlock *> findDominators(DominatorTree *DT, Function &F, BasicBl
 }
 
 
-BasicBlock* mergeBasicBlocks(std::vector<BasicBlock *> & basic_blocks) {
+BasicBlock* mergeBasicBlocks(std::vector<BasicBlock *> &basic_blocks, 
+                             std::unordered_map<Value *, Value *> &cloned_to_original_inst_map) {
   if (basic_blocks.empty()) {
     return nullptr;
   }
@@ -3677,13 +3769,29 @@ BasicBlock* mergeBasicBlocks(std::vector<BasicBlock *> & basic_blocks) {
   for (BasicBlock *bb : basic_blocks) {
     for (Instruction &inst : *bb) {
         Instruction* cloned_inst = inst.clone();
+        cloned_to_original_inst_map[cloned_inst] = &inst;
         vmap[&inst] = WeakTrackingVH(cloned_inst);
         builder.Insert(cloned_inst);
       
     }
   }
+
+  // Remap references from blocks we are merging to values from the new merged block
   for (Instruction &inst : *merged_block) {
     llvm::RemapInstruction(&inst, vmap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+  }
+  
+  // For analysis in RoLAG we want the branch targets to all be the same, so it generates
+  // matched branch instructions
+  // Since we are planning to change all these target locations anyways, we just fill in
+  // with a dummy value
+  for (Instruction &inst : *merged_block) {
+    if (BranchInst *BI = dyn_cast<BranchInst>(&inst)) {
+      unsigned n = BI->getNumSuccessors();
+      for (unsigned i = 0; i < n; i++) {
+        BI->setSuccessor(i, merged_block);
+      }
+    }
   }
 
   return merged_block;
@@ -3736,13 +3844,39 @@ bool LoopRollerCFG::run() {
     errs() << "\t - " << dominator->getName() << "\n";
   }
 
-  BasicBlock* merged_basic_blocks = mergeBasicBlocks(dominators_of_terminator);
+  std::unordered_map<Value *, Value *> cloned_instruction_to_original;
+  BasicBlock* merged_basic_block = mergeBasicBlocks(dominators_of_terminator, cloned_instruction_to_original);
 
   errs() << "Printout out merged_basic_blocks" << "\n";
-  for (Instruction &inst : *merged_basic_blocks) {
+  /*
+  for (Instruction &inst : *merged_basic_block) {
     errs() << inst << "\n";
   }
+  */
+
   errs() << "-------------\n";
+
+  /*
+  errs() << "Printout inst mapping" << "\n";
+  for (auto i : cloned_to_orig_inst_map) {
+    errs() << *i.first << " -> " << *i.second << "\n";
+  }
+  */
+  this->collectSeedInstructionsAndBranches(*merged_basic_block);
+
+  errs() << "Collected branches" << "\n";
+  for (Instruction *it : Seeds.Branches) {
+    errs() << *it << "\n";
+  }
+  AlignedGraphCFG *G = nullptr;
+  this->attemptRollingBranches(*merged_basic_block, G, cloned_instruction_to_original);
+
+  G->writeDotFile("lol.dot");
+
+
+  errs() << "=============\n";
+
+  return false;
 
   bool Changed = false;
 
@@ -3751,10 +3885,10 @@ bool LoopRollerCFG::run() {
     collectSeedInstructions(*BB);
     Changed = Changed;
   }
-#ifdef TEST_DEBUG
+    #ifdef TEST_DEBUG
   errs() << "Done Loop Roller: " << NumRolledLoops << "/" << NumAttempts
          << "\n";
-#endif
+    #endif
   if (NumAttempts == 0)
     errs() << "Nothing found in: " << F.getName() << "\n";
 
