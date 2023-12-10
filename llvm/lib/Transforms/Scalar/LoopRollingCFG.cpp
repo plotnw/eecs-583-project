@@ -44,8 +44,9 @@
 
 using namespace llvm;
 
+// NOTE: Currently overriding default behavior to always roll for testing
 static cl::opt<bool> AlwaysRoll(
-    "loop-rolling-cfg-always", cl::init(false), cl::Hidden,
+    "loop-rolling-cfg-always", cl::init(true), cl::Hidden,
     cl::desc("Always roll loops, skipping the profitability analysis"));
 
 static cl::opt<int> SizeThreshold(
@@ -247,7 +248,8 @@ enum NodeType {
 };
 
 class Node {
-private:
+  // NOTE: Making this public (versus getters/setters)
+public:
   BasicBlock *BBPtr;
   Node *Parent;
   NodeType NType;
@@ -1079,7 +1081,7 @@ public:
 
   std::set<User *> Users;
 
-private:
+public:
   void growGraph(Node *N, BasicBlock &BB, std::set<Node *> &Visited);
 
   template <typename ValueT>
@@ -1130,7 +1132,7 @@ public:
 class SeedGroups {
 public:
   // Tracks parallel branches
-  std::vector<Instruction *> Branches;
+  std::unordered_map<int, std::vector<Instruction *>> Branches;
   
   std::unordered_map<Value *, std::vector<Instruction *>> Stores;
   std::unordered_map<Value *, std::vector<Instruction *>> Calls;
@@ -1144,9 +1146,18 @@ public:
   }
 
   void remove(Instruction *I) {
-    auto it = std::find(Branches.begin(), Branches.end(), I);
-    if (it != Branches.end()) {
-      Branches.erase(it);
+    errs() << "Removing inst: " << "\n";
+    I->dump();
+    errs().flush();
+    errs() << "before find\n";
+    errs().flush();
+    // auto it = find(Branches.begin(), Branches.end(), I);
+    auto it = Branches[0].end();
+    errs() << "after find\n";
+
+    if (it != Branches[0].end()) {
+      Branches[0].erase(it);
+      return;
     }
 
     for (auto &Pair : Stores) {
@@ -1171,9 +1182,9 @@ public:
   }
 
   std::vector<Instruction *> *getGroupWith(Instruction *I) {
-    if (std::find(Branches.begin(), Branches.end(), I) != 
-        Branches.end()) {
-      return &(Branches);
+    if (std::find(Branches[0].begin(), Branches[0].end(), I) != 
+        Branches[0].end()) {
+      return &(Branches[0]);
     }
     for (auto &Pair : Stores) {
       if (std::find(Pair.second.begin(), Pair.second.end(), I) !=
@@ -1196,7 +1207,9 @@ public:
 
   bool generate(SeedGroups &Seeds);
 
-private:
+  bool generate_branches(SeedGroups &Seeds);
+
+public:
   Function &F;
   BasicBlock &BB;
   AlignedGraphCFG &G;
@@ -2476,7 +2489,14 @@ Value *CodeGeneratorCFG::cloneGraph(Node *N, IRBuilder<> &Builder) {
   case NodeType::IDENTICAL: {
     #ifdef TEST_DEBUG
     errs() << "Generating IDENTICAL\n";
+    //errs() << "\t" << N->Values.size() << "," << *(N->getValue(0)) << "\n";
     #endif
+
+    // NOTE: Adding identical nodes to node to value map to create mapping
+    //       from nodes to values later (covering identical case)
+    // WARNING: This may affect creation of PHI nodes later on (only real use
+    //          of NodeToValue as far as I know)
+    NodeToValue[N] = N->getValue(0);
     return N->getValue(0);
   }
   case NodeType::MULTI: {
@@ -3192,18 +3212,18 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
       Pair.first->replaceAllUsesWith(Pair.second);
     }
 
-    // BB.dump();
-    // PreHeader->dump();
-    // Header->dump();
-    // Exit->dump();
+     BB.dump();
+     PreHeader->dump();
+     Header->dump();
+     Exit->dump();
 
     for (auto It = Exit->rbegin(), E = Exit->rend(); It != E;) {
       Instruction *I = &*It;
       It++;
       if (Garbage.count(I)) {
         // Garbage.erase(I);
-        // errs() << "Removed from " << I->getParent()->getName() << ": ";
-        // I->dump();
+        errs() << "Removed from " << I->getParent()->getName() << ": ";
+        I->dump();
         Seeds.remove(I);
         I->eraseFromParent();
       }
@@ -3213,15 +3233,16 @@ bool CodeGeneratorCFG::generate(SeedGroups &Seeds) {
       It++;
       if (Garbage.count(I)) {
         // Garbage.erase(I);
-        // errs() << "Removed from " << I->getParent()->getName() << ": ";
-        // I->dump();
+        errs() << "Removed from " << I->getParent()->getName() << ": ";
+        I->dump();
         Seeds.remove(I);
         I->eraseFromParent();
       }
     }
-    // for (auto *V : Garbage) {
-    //   errs() << "Garbage: "; V->dump();
-    // }
+    for (auto *V : Garbage) {
+      // Causes a crash, for some reason? malformed instruction?
+      //errs() << "Garbage: "; V->dump();
+    }
 
     for (BasicBlock *Succ : SuccBBs) {
       for (Instruction &I : *Succ) { // TODO: run only over PHIs
@@ -3301,8 +3322,11 @@ static BinaryOperator *getPossibleReduction(Value *V) {
 
 void LoopRollerCFG::collectSeedInstructionsAndBranches(BasicBlock &BB) {
   Seeds.clear();
+  // Seeds.Branches.reserve(1024);
+  u_int curr_branch_index = 0;
   for (Instruction &I : BB) {
-    if (auto *BI = dyn_cast<BranchInst>(&I)) {
+    // auto *BI = dyn_cast<BranchInst>(&I);
+    if (isa<BranchInst>(I)) {
       // For now, we are assuming anytime we see multiple branches in a BB
       // it was the result of us merging a basic block, and so in particular
       // the branches are intended to be rolled together. We don't actually
@@ -3312,7 +3336,7 @@ void LoopRollerCFG::collectSeedInstructionsAndBranches(BasicBlock &BB) {
       // But since we made this function and intend to call only in the 
       // situations we want to do branches, it should be fine
       
-      Seeds.Branches.emplace_back(BI);
+      Seeds.Branches[curr_branch_index].push_back(&I);
     }
       // we also are not intending to support reduction trees, so we remove the code for that here
   }
@@ -3451,22 +3475,8 @@ bool LoopRollerCFG::attemptRollingBranches(BasicBlock &BB, AlignedGraphCFG *&G,
     return false;
   }
   bool Changed = false;
-  if (!Seeds.Branches.empty()) {
-      G = new AlignedGraphCFG(Seeds.Branches, BB, cloned_instruction_to_original, SE);
-      /*
-      if (G.isSchedulable(BB)) {
-        NumAttempts++;
-        CodeGeneratorCFG CG(F, BB, G);
-        bool HasRolled = CG.generate(Seeds);
-        Changed = Changed || HasRolled;
-        if (HasRolled)
-          NumRolledLoops++;
-      } else {
-        errs() << G.getDotString() << "\n";
-        // BB.dump();
-      }
-      G.destroy();
-      */
+  if (!Seeds.Branches[0].empty()) {
+      G = new AlignedGraphCFG(Seeds.Branches[0], BB, cloned_instruction_to_original, SE);
     }
   return Changed;
 }
@@ -3844,15 +3854,16 @@ bool LoopRollerCFG::run() {
     errs() << "\t - " << dominator->getName() << "\n";
   }
 
+  // cloned_if -> original_if
   std::unordered_map<Value *, Value *> cloned_instruction_to_original;
   BasicBlock* merged_basic_block = mergeBasicBlocks(dominators_of_terminator, cloned_instruction_to_original);
 
   errs() << "Printout out merged_basic_blocks" << "\n";
-  /*
+  
   for (Instruction &inst : *merged_basic_block) {
     errs() << inst << "\n";
   }
-  */
+  
 
   errs() << "-------------\n";
 
@@ -3865,7 +3876,7 @@ bool LoopRollerCFG::run() {
   this->collectSeedInstructionsAndBranches(*merged_basic_block);
 
   errs() << "Collected branches" << "\n";
-  for (Instruction *it : Seeds.Branches) {
+  for (Instruction *it : Seeds.Branches[0]) {
     errs() << *it << "\n";
   }
   AlignedGraphCFG *G = nullptr;
@@ -3873,9 +3884,159 @@ bool LoopRollerCFG::run() {
 
   G->writeDotFile("lol.dot");
 
+  errs() << "Printing Alignment Graph - Nodes to Source Values: \n";
+  for (Node *n : G->Nodes) {
+    errs() << n->getString() << "\n";
+    errs() << n->getNodeType() << "\n";
+    for (Value *v : n->Values) {
+      errs() << "\t" << *v << "\n";
+    }
+  }
+  errs() << "Done Printing Alignment Graph";
+
+  if (G->isSchedulable(*merged_basic_block)) {
+    errs() << "yes it is schedulable" << "\n";
+  } else {
+    errs() << "no it is not uh oh" << "\n";
+  }
+  
+  CodeGeneratorCFG CG(F, *merged_basic_block, *G);
+  bool HasRolled = CG.generate(Seeds);
+  
+  // errs() << "Printing Alignment Graph - Nodes to Target Values: \n";
+  // for (Node *n : G->Nodes) {
+  //   errs() << n->getString() << " -> ";
+  //   CG.NodeToValue[n]->dump();
+  //   errs() << "\n";
+  // }
+
+  // cloned_then -> original_then/original_if -> cloned_if -> node_if -> rolled_if
+  // cloned_then -> original_then
+  
+  // 1) Original value in then block
+  // 2) Original value in if block (through a usage)
+  // 3) Cloned value in merged_basic_block
+  // 4) Node in AG cloned value is in
+  // 5) Node in AG to inst in rolled code (value) 
+
+  // To do 3, we need to apply inverse of cloned_instruction_to_original map
+  // To do 4, we need to invert Node::Values (done in source_values_to_target_nodes)
+  // To do 5, we just use CG.NodeToValue
+
+  // original_if -> cloned_if
+  std::unordered_map<Value *, Value *> original_instruction_to_cloned_if;
+  for (auto instruction_pair : cloned_instruction_to_original) {
+    original_instruction_to_cloned_if[instruction_pair.second] = instruction_pair.first;
+  }
+  
+  // cloned_if -> node_if
+  std::unordered_map<Value *, Node *> source_values_to_target_nodes;
+  for (Node *n : G->Nodes) {
+    for (Value *v : n->Values) {
+      source_values_to_target_nodes[v] = n;
+    }
+  }
+
+  // node_if -> rolled_if
+  std::unordered_map<Node *, Value *> node_to_value(CG.NodeToValue);
+
+  std::unordered_map<Value *, Value *> original_instruction_to_rolled;
+  u_int instruction_sanity_count = 0;
+  u_int identical_instruction_sanity_count = 0;
+  for (BasicBlock *bb : dominators_of_terminator) {
+    for (Instruction &inst : *bb) {
+      instruction_sanity_count++;
+
+      // original_if -> cloned_if
+      auto found_cloned = original_instruction_to_cloned_if.find(dyn_cast<Value>(&inst));
+      if (found_cloned == original_instruction_to_cloned_if.end()) {
+        errs() << "failed to find clone for:\n"
+               << inst << "\n";  
+        continue;      
+      }
+      Value *cloned_inst = found_cloned->second;
+      /*
+      // first check if cloned inst is still in mergedDominators
+      for (Instruction &i : *merged_basic_block) {
+        if (&i == cloned_inst) {
+          identical_instruction_sanity_count++;
+          //found it
+          original_instruction_to_rolled[&inst] = &i;
+          continue;
+        }
+      }*/
+      
+      // cloned_if -> node_if
+      auto found_node = source_values_to_target_nodes.find(cloned_inst);
+      if (found_node == source_values_to_target_nodes.end()) {
+        errs() << "failed to find node for:\n"
+               << inst << "\n" 
+               << *cloned_inst << "\n";  
+        continue;      
+      }
+      Node *node = found_node->second;
+
+      // node_if -> rolled_if
+      auto found_value = node_to_value.find(node);
+      if (found_value == node_to_value.end()) {
+        errs() << "failed to find value for:\n"
+               << inst << "\n" 
+               << *cloned_inst << "\n"
+               << node->getString() << "\n";
+        
+        continue;      
+      }
+      Value *rolled_inst = found_value->second;
+      original_instruction_to_rolled[&inst] = rolled_inst;
+    }
+  }
+
+  errs() << "Printing out mapping: \n";
+  errs() << "\tMapped " << original_instruction_to_rolled.size() << " / "
+         << instruction_sanity_count << " instructions\n";
+  errs() << "\tIdentical " << identical_instruction_sanity_count << " / "
+         << instruction_sanity_count << " instructions\n";
+
+  /*
+  for (auto thingie : original_instruction_to_rolled) {
+    errs() << *thingie.first << "\n\t -> " << *thingie.second << "\n";
+  }
+  */
+
+  errs() << "question mark" << "\n";
+
+  for (BasicBlock *bb : dominators_of_terminator) {
+    for (Instruction &i : *bb) {
+      auto it = original_instruction_to_rolled.find(&i);
+      if (it == original_instruction_to_rolled.end()) {
+        errs() << i << " -> " << "null" << "\n";
+      } else {
+        errs() << i << " -> " << *it->second << "\n";
+      }
+    }
+  }
+
+
+
+  // bool Changed = false;
+  // if (G->isSchedulable(*merged_basic_block)) {
+  //   NumAttempts++;
+  //   CodeGeneratorCFG CG(F, *merged_basic_block, G);
+  //   bool HasRolled = CG.generate(Seeds);
+  //   Changed = Changed || HasRolled;
+  //   if (HasRolled)
+  //     NumRolledLoops++;
+  // } else {
+  //   errs() << G->getDotString() << "\n";
+  //   // BB.dump();
+  // }
+  // G->destroy();
+
+
+
 
   errs() << "=============\n";
-
+  
   return false;
 
   bool Changed = false;
