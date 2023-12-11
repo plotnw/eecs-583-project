@@ -4225,16 +4225,22 @@ bool LoopRollerCFG::run() {
   if (!original_loop_preheader_branch || original_loop_preheader_branch->isConditional()) {
     errs() << "No unconditional branch instruction in innermost loop preheader\n";
   } else {
-    original_loop_preheader_branch->setSuccessor(0, CG.PreHeader);
+    original_loop_preheader_branch->setSuccessor(0, merged_basic_block);
   }
-  
 
-  // Fix rolled loop exit to jump to exit block of the original loop
-  Instruction *last_then_rolled_exit = CG.Exit->getTerminator();
+    // Fix rolled loop exit to jump to exit block of the original loop
   IRBuilder<> br_fixup_builder_exit(CG.Exit);
-  br_fixup_builder.SetInsertPoint(last_then_rolled_exit);
+  br_fixup_builder.SetInsertPoint(CG.Exit);
   br_fixup_builder.CreateBr(curr_exit_block);
 
+  // Fix original loop exit to jump to rolled if statements preheader
+  BranchInst *original_exit_branch = dyn_cast<BranchInst>(curr_exit_block->getTerminator());
+  if (!original_exit_branch || !original_exit_branch->isConditional()) {
+    errs() << "No conditional branch instruction in innermost loop exit\n";
+  } else {
+    //TODO probably should try to find from the targets the previous header we merged rather than hardcode 1
+    original_exit_branch->setSuccessor(1, merged_basic_block);
+  }
 
   // Remove merged basic blocks
 
