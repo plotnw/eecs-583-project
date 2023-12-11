@@ -3854,6 +3854,23 @@ bool LoopRollerCFG::run() {
     errs() << "\t - " << dominator->getName() << "\n";
   }
 
+  // Check to make sure all dominators of terminator have a conditional at the end
+  // i.e. do we actually have if statements/diamonds
+  // if not, just return
+  bool found_non_cond_terminator = false;
+  for (BasicBlock *bb : dominators_of_terminator) {
+    BranchInst *BI = dyn_cast<BranchInst>(bb->getTerminator());
+    if (!BI && BI->isConditional()) {
+      found_non_cond_terminator = true;
+    }
+  }
+  
+  if (found_non_cond_terminator) {
+    errs() << "Aboring, found weird CFG structure\n";
+    return false;
+  }
+  
+
   // cloned_if -> original_if
   std::unordered_map<Value *, Value *> cloned_instruction_to_original;
   BasicBlock* merged_basic_block = mergeBasicBlocks(dominators_of_terminator, cloned_instruction_to_original);
@@ -4032,6 +4049,49 @@ bool LoopRollerCFG::run() {
   // }
   // G->destroy();
 
+  // By assumption, we have conditional branches, so all have 2 children
+  std::vector<BasicBlock *> left_children_of_ifs;
+  std::vector<BasicBlock *> right_children_of_ifs;
+  for (BasicBlock *bb : dominators_of_terminator) {
+    BranchInst *BI = dyn_cast<BranchInst>(bb->getTerminator());
+    if (BI == nullptr) {
+      errs() << "erm got a nullptr, shouldnt happen?" << "\n";
+    }
+    left_children_of_ifs.push_back(BI->getSuccessor(0));
+    right_children_of_ifs.push_back(BI->getSuccessor(1));
+  }
+
+  std::vector<BasicBlock *bb> allowed_dom_targets;
+  for (BasicBlock *bb : dominators_of_terminator) {
+    allowed_dom_targ
+ts.push_back(b)  }
+  bool left_is_in_dom_list =
+  
+  for (BasicBlock *bb : left_children_of_ifs) {
+
+  }
+
+  if (right_children_of_ifs.empty() && 
+      left_children_of_ifs.size() == dominators_of_terminator.size()) {
+    for (BasicBlock *taken_child : left_children_of_ifs) {
+      errs() << taken_child->getName() << "\n";
+    }
+  }
+  else {
+    errs() << "Successors of dominators of terminator not consistent, aborting\n";
+    return false;
+  }
+
+  std::unordered_map<Value* , Value*> cloned_non_terminator_instructions_to_original;
+  BasicBlock* merged_non_dominators = mergeBasicBlocks(left_children_of_ifs,
+          non_terminator_cloned_instructions_to_original);
+  
+  ValueToValueMapTy non_terminator_cloned_to_original_instructions;
+  
+
+  for (Instruction &inst : *merged_non_dominators) {
+    llvm::RemapInstruction(&inst, vmap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+  }
 
 
 
