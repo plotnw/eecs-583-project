@@ -1261,7 +1261,7 @@ private:
   void collectSeedInstructions(BasicBlock &BB);
   bool attemptRollingBranches(BasicBlock &BB, AlignedGraphCFG *&G, 
                               std::unordered_map<Value *, Value *> &cloned_instruction_to_original);
-  bool attemptRollingSeeds(BasicBlock &BB,
+  bool attemptRollingSeeds(BasicBlock &BB,std::vector<CodeGeneratorCFG *> &CGCFGs,
                            std::unordered_map<Value *, Value *> &cloned_instruction_to_original);
   // void codeGeneration(Tree &T, BasicBlock &BB);
 
@@ -3481,10 +3481,10 @@ bool LoopRollerCFG::attemptRollingBranches(BasicBlock &BB, AlignedGraphCFG *&G,
   return Changed;
 }
 
-bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB, 
+bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB, std::vector<CodeGeneratorCFG *> &CGCFGs,
                                         std::unordered_map<Value *, Value *> &cloned_instruction_to_original) {
   bool Changed = false;
-
+  unsigned counter = 0;
   for (auto &Pair : Seeds.Stores) {
     bool Valid = true;
     errs() << "Attempting Group:\n";
@@ -3527,12 +3527,15 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
         AlignedGraphCFG G(MN, BB, SE);
         if (G.isSchedulable(BB)) {
           NumAttempts++;
-          CodeGeneratorCFG CG(F, BB, G);
-          bool HasRolled = CG.generate(Seeds);
+          CodeGeneratorCFG *CG = new CodeGeneratorCFG(F, BB, G);
+          bool HasRolled = CG->generate(Seeds);
+          CGCFGs.push_back(CG);
           Changed = Changed || HasRolled;
           if (HasRolled)
             NumRolledLoops++;
         }
+        //G.writeDotFile("dota." + std::to_string(counter));
+        counter++;
         G.destroy();
       } else
         delete MN;
@@ -3580,12 +3583,15 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
         AlignedGraphCFG G(MN, BB, SE);
         if (G.isSchedulable(BB)) {
           NumAttempts++;
-          CodeGeneratorCFG CG(F, BB, G);
-          bool HasRolled = CG.generate(Seeds);
+          CodeGeneratorCFG *CG = new CodeGeneratorCFG(F, BB, G);
+          bool HasRolled = CG->generate(Seeds);
+          CGCFGs.push_back(CG);
           Changed = Changed || HasRolled;
           if (HasRolled)
             NumRolledLoops++;
         }
+        //G.writeDotFile("dota." + std::to_string(counter));
+        counter++;
         G.destroy();
       } else
         delete MN;
@@ -3608,8 +3614,9 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
           AlignedGraphCFG G(StoreInsts, BB, cloned_instruction_to_original, SE);
           if (G.isSchedulable(BB)) {
             NumAttempts++;
-            CodeGeneratorCFG CG(F, BB, G);
-            HasRolled = CG.generate(Seeds);
+            CodeGeneratorCFG *CG = new CodeGeneratorCFG(F, BB, G);
+            HasRolled = CG->generate(Seeds);
+            CGCFGs.push_back(CG);
             if (HasRolled)
               NumRolledLoops++;
             Changed = Changed || HasRolled;
@@ -3617,6 +3624,8 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
             errs() << G.getDotString() << "\n";
             // BB.dump();
           }
+          //G.writeDotFile("dota." + std::to_string(counter));
+          counter++;
           G.destroy();
         }
         if (!HasRolled && FirstAttempt) {
@@ -3660,12 +3669,15 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
     AlignedGraphCFG G(Pair.first, Pair.second, BB, SE);
     if (G.isSchedulable(BB)) {
       NumAttempts++;
-      CodeGeneratorCFG CG(F, BB, G);
-      bool HasRolled = CG.generate(Seeds);
+      CodeGeneratorCFG *CG = new CodeGeneratorCFG(F, BB, G);
+      bool HasRolled = CG->generate(Seeds);
+      CGCFGs.push_back(CG);
       Changed = Changed || HasRolled;
       if (HasRolled)
         NumRolledLoops++;
     }
+    //G.writeDotFile("dota." + std::to_string(counter));
+    counter++;
     G.destroy();
   }
     #ifdef TEST_DEBUG
@@ -3676,8 +3688,9 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
       AlignedGraphCFG G(Pair.second, BB, cloned_instruction_to_original, SE);
       if (G.isSchedulable(BB)) {
         NumAttempts++;
-        CodeGeneratorCFG CG(F, BB, G);
-        bool HasRolled = CG.generate(Seeds);
+        CodeGeneratorCFG *CG = new CodeGeneratorCFG(F, BB, G);
+        bool HasRolled = CG->generate(Seeds);
+        CGCFGs.push_back(CG);
         Changed = Changed || HasRolled;
         if (HasRolled)
           NumRolledLoops++;
@@ -3685,6 +3698,8 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
         errs() << G.getDotString() << "\n";
         // BB.dump();
       }
+      //G.writeDotFile("dota." + std::to_string(counter));
+      counter++;
       G.destroy();
     }
   }
@@ -3699,12 +3714,15 @@ bool LoopRollerCFG::attemptRollingSeeds(BasicBlock &BB,
     AlignedGraphCFG G(Pair.first, Pair.second, BB, SE);
     if (G.isSchedulable(BB)) {
       NumAttempts++;
-      CodeGeneratorCFG CG(F, BB, G);
-      bool HasRolled = CG.generate(Seeds);
+      CodeGeneratorCFG *CG = new CodeGeneratorCFG(F, BB, G);
+      bool HasRolled = CG->generate(Seeds);
+      CGCFGs.push_back(CG);      
       Changed = Changed || HasRolled;
       if (HasRolled)
         NumRolledLoops++;
     }
+    //G.writeDotFile("dota." + std::to_string(counter));
+    counter++;
     G.destroy();
   }
 
@@ -4098,6 +4116,7 @@ bool LoopRollerCFG::run() {
   std::unordered_map<Value* , Value*> cloned_non_terminator_instructions_to_original;
   BasicBlock* merged_non_dominators = mergeBasicBlocks(left_children_of_ifs,
           cloned_non_terminator_instructions_to_original);
+          //TODO: strip out branches here, so we generate cleaner exit block?
   
   ValueToValueMapTy original_instruction_to_rolled_vh;
   for (auto mapping_pair : original_instruction_to_rolled) {
@@ -4131,34 +4150,104 @@ bool LoopRollerCFG::run() {
   }
   // NOTE: Ignore reductions for now :)
 
-  AlignedGraphCFG *G_then = nullptr;
-  this->attemptRollingBranches(*merged_non_dominators, G_then, 
-    cloned_non_terminator_instructions_to_original);
+  std::vector<CodeGeneratorCFG *> CGCFGS;
+  this->attemptRollingSeeds(*merged_non_dominators, CGCFGS, cloned_non_terminator_instructions_to_original);
+  
+  // CG.Header;
 
-  G_then->writeDotFile("dota.dot");
+  BasicBlock *split_header_bottom = BasicBlock::Create(
+    CG.Header->getContext(), 
+    "splitRolledIfHeaderTop", 
+    CG.Header->getParent()
+  );
 
-  errs() << "Printing Alignment Graph - Nodes to Source Values: \n";
-  for (Node *n : G_then->Nodes) {
-    errs() << n->getString() << "\n";
-    errs() << n->getNodeType() << "\n";
-    for (Value *v : n->Values) {
-      errs() << "\t" << *v << "\n";
+  // Fixup code
+
+  errs() << "Beginning fixup\n";
+  IRBuilder<> fixup_builder(split_header_bottom);
+  
+  // Split the header for the if basic block
+  bool found_if_branch;
+  std::vector<Instruction *> insts_to_move;
+
+  for (Instruction &inst : *CG.Header) {
+    if (!found_if_branch) {
+      // not a great way to find the branch (fix-up for alignment graph mismatch) but it is correct
+      // alternatively use the original to rolled map to find the branch
+      BranchInst *BI = dyn_cast<BranchInst>(&inst);
+      if (BI) {
+        if (BI->getSuccessor(0) == merged_basic_block && BI->getSuccessor(1) == merged_basic_block) {
+          found_if_branch = true;
+        }
+      }
+    } else {
+      insts_to_move.push_back(&inst);
     }
   }
-  errs() << "Done Printing Alignment Graph";
+  
+  for (Instruction *inst : insts_to_move) {
+    inst->removeFromParent();
+    fixup_builder.Insert(inst);
+  }
+  split_header_bottom->dump();
 
-  if (G_then->isSchedulable(*merged_non_dominators)) {
-    errs() << "yes it is schedulable" << "\n";
+  // Replace the usage of the induction variable in the rolled then block with the rolled if block
+  // NOTE: In theory for our simple case this is not necessary (both induction variables should
+  //       be the same so they can be reused after making the branch unconditional and DCE)
+  //CG.IndVar;
+  //CGCFGS.at(n).IndVar
+
+  // Fix the branch of the then rolled block
+  Instruction *last_then_rolled_br = CGCFGS.at(0)->Header->getTerminator();
+  IRBuilder<> br_fixup_builder(CGCFGS.at(0)->Header);
+  br_fixup_builder.SetInsertPoint(last_then_rolled_br);
+  br_fixup_builder.CreateBr(split_header_bottom);
+  last_then_rolled_br->eraseFromParent();
+
+  split_header_bottom->dump();
+  CGCFGS.at(0)->Header->dump();
+  
+  // Fix targets of rolled if statement
+  BranchInst *rolled_if_body_branch = dyn_cast<BranchInst>(CG.Header->getTerminator());
+  if (!rolled_if_body_branch) {
+    errs() << "No branch instruction in upper half of rolled if-blocks\n";
   } else {
-    errs() << "no it is not uh oh" << "\n";
+    rolled_if_body_branch->setSuccessor(0, CGCFGS.at(0)->Header);
+    rolled_if_body_branch->setSuccessor(1, split_header_bottom);
+  }
+
+  CG.Header->dump();
+  split_header_bottom->dump();
+  CGCFGS.at(0)->Header->dump();
+
+  // Fix original loop header to jump to rolled if statements preheader
+  BranchInst *original_loop_preheader_branch = dyn_cast<BranchInst>(curr_preheader->getTerminator());
+  if (!original_loop_preheader_branch || original_loop_preheader_branch->isConditional()) {
+    errs() << "No unconditional branch instruction in innermost loop preheader\n";
+  } else {
+    original_loop_preheader_branch->setSuccessor(0, CG.PreHeader);
   }
   
-  CodeGeneratorCFG CG_then(F, *merged_non_dominators, *G_then);
-  bool HasRolled_then = CG_then.generate(Seeds);
+
+  // Fix rolled loop exit to jump to exit block of the original loop
+  Instruction *last_then_rolled_exit = CG.Exit->getTerminator();
+  IRBuilder<> br_fixup_builder_exit(CG.Exit);
+  br_fixup_builder.SetInsertPoint(last_then_rolled_exit);
+  br_fixup_builder.CreateBr(curr_exit_block);
+
+
+  // Remove merged basic blocks
+
+  errs() << "dumping function" << "\n";
+  F.dump();
+
+
+  
+
 
   errs() << "=============\n";
   
-  return false;
+  return true;
 
   bool Changed = false;
 
