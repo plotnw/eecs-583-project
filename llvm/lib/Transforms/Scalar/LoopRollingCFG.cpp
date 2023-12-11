@@ -4157,7 +4157,7 @@ bool LoopRollerCFG::run() {
 
   BasicBlock *split_header_bottom = BasicBlock::Create(
     CG.Header->getContext(), 
-    "splitRolledIfHeaderTop", 
+    "splitRolledIfHeaderBottom", 
     CG.Header->getParent()
   );
 
@@ -4240,9 +4240,73 @@ bool LoopRollerCFG::run() {
   } else {
     //TODO probably should try to find from the targets the previous header we merged rather than hardcode 1
     original_exit_branch->setSuccessor(1, merged_basic_block);
+    // for (u_int i = 0; i < original_exit_branch->getNumSuccessors(); ++i) {
+    //   if (original_exit_branch->getSuccessor(i) == curr_preheader) {
+    //     original_exit_branch->setSuccessor(i, merged_basic_block);
+    //     break;
+    //   }
+    // }
   }
 
+  // Fixup references in the exit block to point to cloned versions
+  // TODO instead of applying everything, only check the induction variable
+  // but that isnt quite right either, since there can be multiple constants
+  // really we should duplicate the original_to_rolled value map and 
+  // use the full-depth search over nodes instead of aborting at first instance
+  // we found
+
+  // NOTE: 
+  for (Instruction &inst : *curr_exit_block) {
+    unsigned int n = inst.getNumOperands();
+    for (unsigned int i = 0; i < n; i++) {
+      Value *v = inst.getOperand(i);
+      auto it = original_instruction_to_cloned_if.find(v);
+      if (it != original_instruction_to_cloned_if.end()) {
+        inst.setOperand(i, (*it).second);
+      }
+    }
+  }
+
+  // Fixup induction variable to phi off of the correct block
+  PHINode *cg_invvar = dyn_cast<PHINode>(CG.IndVar);
+  errs() << *cg_invvar << "\n";
+  unsigned int header_incoming_index = cg_invvar->getBasicBlockIndex(CG.Header);
+  if (header_incoming_index == -1) {
+    errs() << "failed to update phi_if, something went wrong " << "\n" << CG.Header->getName() << "\n";
+  } else {
+    cg_invvar->setIncomingBlock(header_incoming_index, split_header_bottom);
+  }
+
+  // Fixup bad phi in the then block rolled loop
+  // it will get removed by dead code, but it confuses llvm we think
+  PHINode *cg_invvar_then = dyn_cast<PHINode>(CGCFGS.at(0)->IndVar);
+  errs() << *cg_invvar_then << "\n";
+  unsigned int header_then_incoming_index = cg_invvar_then->getBasicBlockIndex(CGCFGS.at(0)->Header);
+  if (header_then_incoming_index == -1) {
+    errs() << "failed to update phi_then, something went wrong " << "\n" << CGCFGS.at(0)->Header->getName() << "\n";
+  } else {
+    cg_invvar_then->setIncomingBlock(header_then_incoming_index, CG.Header);
+  }
+
+  // Fixup usages of the induction variable in then rolled loop
+  Instruction *then_indvar = CGCFGS.at(0)->IndVar;
+  Instruction *if_indvar = CG.IndVar;
+  errs() << *then_indvar << "\n";
+  for (Instruction &inst : *CGCFGS.at(0)->Header) {
+    unsigned int n = inst.getNumOperands();
+    for (unsigned int i = 0; i < n; i++) {
+      Value *v = inst.getOperand(i);
+        if (v == then_indvar) {
+        inst.setOperand(i, if_indvar);
+      }
+    }
+  }
+  then_indvar->eraseFromParent();
+
+
   // Remove merged basic blocks
+  // Handled by LLVM CFGSimplify
+
 
   errs() << "dumping function" << "\n";
   F.dump();
@@ -4255,21 +4319,21 @@ bool LoopRollerCFG::run() {
   
   return true;
 
-  bool Changed = false;
+  // bool Changed = false;
 
-  for (BasicBlock *BB : Blocks) {
-    errs() << "BlockSize: " << BB->size() << "\n";
-    collectSeedInstructions(*BB);
-    Changed = Changed;
-  }
-    #ifdef TEST_DEBUG
-  errs() << "Done Loop Roller: " << NumRolledLoops << "/" << NumAttempts
-         << "\n";
-    #endif
-  if (NumAttempts == 0)
-    errs() << "Nothing found in: " << F.getName() << "\n";
+  // for (BasicBlock *BB : Blocks) {
+  //   errs() << "BlockSize: " << BB->size() << "\n";
+  //   collectSeedInstructions(*BB);
+  //   Changed = Changed;
+  // }
+  //   #ifdef TEST_DEBUG
+  // errs() << "Done Loop Roller: " << NumRolledLoops << "/" << NumAttempts
+  //        << "\n";
+  //   #endif
+  // if (NumAttempts == 0)
+  //   errs() << "Nothing found in: " << F.getName() << "\n";
 
-  return Changed;
+  // return Changed;
 }
 
 bool LoopRollingCFG::runImpl(Function &F, ScalarEvolution *SE,
