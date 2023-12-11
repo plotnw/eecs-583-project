@@ -4167,7 +4167,7 @@ bool LoopRollerCFG::run() {
   IRBuilder<> fixup_builder(split_header_bottom);
   
   // Split the header for the if basic block
-  bool found_if_branch;
+  bool found_if_branch = false;
   std::vector<Instruction *> insts_to_move;
 
   for (Instruction &inst : *CG.Header) {
