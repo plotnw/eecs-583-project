@@ -4116,8 +4116,7 @@ bool LoopRollerCFG::run() {
   std::unordered_map<Value* , Value*> cloned_non_terminator_instructions_to_original;
   BasicBlock* merged_non_dominators = mergeBasicBlocks(left_children_of_ifs,
           cloned_non_terminator_instructions_to_original);
-          //TODO: strip out branches here, so we generate cleaner exit block?
-  
+          //TODO: strip out branches here, so we generate cleaner exit block? 
   ValueToValueMapTy original_instruction_to_rolled_vh;
   for (auto mapping_pair : original_instruction_to_rolled) {
     original_instruction_to_rolled_vh[mapping_pair.first] = 
@@ -4152,6 +4151,23 @@ bool LoopRollerCFG::run() {
 
   std::vector<CodeGeneratorCFG *> CGCFGS;
   this->attemptRollingSeeds(*merged_non_dominators, CGCFGS, cloned_non_terminator_instructions_to_original);
+
+  BasicBlock *merged_right_succs = nullptr;
+
+  // if rhs not if statements, have if else
+  std::vector<CodeGeneratorCFG *> CGCFGS_right;
+  if (right_first_not_in) {
+    std::unordered_map<Value* , Value*> right_cloned_non_terminator_instructions_to_original;
+
+    merged_right_succs = mergeBasicBlocks(right_children_of_ifs, right_cloned_non_terminator_instructions_to_original);
+    errs() << "Rerolling right children of ifs\n";
+
+    this->collectSeedInstructions(*merged_right_succs);
+    this->attemptRollingSeeds(*merged_right_succs, CGCFGS_right, right_cloned_non_terminator_instructions_to_original);
+  } else {
+    errs() << "not rolling elses since they are ifs\n";
+  }
+
   
   // CG.Header;
 
@@ -4204,6 +4220,15 @@ bool LoopRollerCFG::run() {
   br_fixup_builder.CreateBr(split_header_bottom);
   last_then_rolled_br->eraseFromParent();
 
+  // If we have an else block, also fix its branch
+  if (right_first_not_in) {
+    Instruction *last_then_rolled_br = CGCFGS_right.at(0)->Header->getTerminator();
+    IRBuilder<> br_fixup_builder(CGCFGS_right.at(0)->Header);
+    br_fixup_builder.SetInsertPoint(last_then_rolled_br);
+    br_fixup_builder.CreateBr(split_header_bottom);
+    last_then_rolled_br->eraseFromParent();
+  }
+
   split_header_bottom->dump();
   CGCFGS.at(0)->Header->dump();
   
@@ -4213,7 +4238,11 @@ bool LoopRollerCFG::run() {
     errs() << "No branch instruction in upper half of rolled if-blocks\n";
   } else {
     rolled_if_body_branch->setSuccessor(0, CGCFGS.at(0)->Header);
-    rolled_if_body_branch->setSuccessor(1, split_header_bottom);
+    if (right_first_not_in) {
+      rolled_if_body_branch->setSuccessor(1, CGCFGS_right.at(0)->Header);
+    } else {
+      rolled_if_body_branch->setSuccessor(1, split_header_bottom);
+    }
   }
 
   CG.Header->dump();
@@ -4287,6 +4316,17 @@ bool LoopRollerCFG::run() {
   } else {
     cg_invvar_then->setIncomingBlock(header_then_incoming_index, CG.Header);
   }
+  // do the same for elses, if it exists
+  if (right_first_not_in) {
+    PHINode *cg_invvar_then = dyn_cast<PHINode>(CGCFGS_right.at(0)->IndVar);
+    errs() << *cg_invvar_then << "\n";
+    unsigned int header_then_incoming_index = cg_invvar_then->getBasicBlockIndex(CGCFGS_right.at(0)->Header);
+    if (header_then_incoming_index == -1) {
+      errs() << "failed to update phi_then, something went wrong " << "\n" << CGCFGS_right.at(0)->Header->getName() << "\n";
+    } else {
+      cg_invvar_then->setIncomingBlock(header_then_incoming_index, CG.Header);
+    }
+  }
 
   // Fixup usages of the induction variable in then rolled loop
   Instruction *then_indvar = CGCFGS.at(0)->IndVar;
@@ -4302,6 +4342,21 @@ bool LoopRollerCFG::run() {
     }
   }
   then_indvar->eraseFromParent();
+  // if else block exists, do the same
+  if (right_first_not_in) {
+    Instruction *then_indvar = CGCFGS_right.at(0)->IndVar;
+    Instruction *if_indvar = CG.IndVar;
+    errs() << *then_indvar << "\n";
+    for (Instruction &inst : *CGCFGS_right.at(0)->Header) {
+      unsigned int n = inst.getNumOperands();
+      for (unsigned int i = 0; i < n; i++) {
+        Value *v = inst.getOperand(i);
+          if (v == then_indvar) {
+          inst.setOperand(i, if_indvar);
+        }
+      }
+    }
+  }
 
 
   // Remove merged basic blocks
